@@ -1,0 +1,54 @@
+# voice-pipeline configuration
+# Paths point into the p4p workspace — adjust if you move things.
+
+qwen3_model: "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+device: "cuda:0"
+dtype: "bfloat16"
+
+# Where generated datasets land (relative to this file, or absolute)
+datasets_dir: "/home/jay/p4p/datasets"
+
+# Piper training workspace
+piper_repo: "/home/jay/p4p/piper_training/repo/piper1-gpl"
+piper_training_output_dir: "/home/jay/p4p/piper_training"
+
+# Fallback server
+fallback:
+  cache_dir: "/home/jay/voice-pipeline/fallback/cache"
+  host: "0.0.0.0"
+  port: 8000
+
+languages:
+  en:
+    qwen_language: "English"
+    reference_audio: "/home/jay/p4p/reference/prompt_piper_16k.wav"
+    # Transcript of the reference audio (from piper-recording-studio clips 0000000015 + 0000000008 + 0000000001)
+    reference_transcript: >-
+      The two reservoirs fed by the Colorado River watershed, provide a critical supply of drinking water
+      and irrigation for many across the region, including rural farms, ranches and native communities.
+      This blueberry coffee cake is my go-to recipe for all of our holiday get-togethers, because it's
+      perfect for breakfast or dessert.
+      Having complete focus on a recipe, and not allowing yourself to be distracted by your thoughts,
+      can have a therapeutic effect.
+    corpus: "/home/jay/p4p/piper_training/LJSpeech-1.1/metadata.csv"
+    espeak_voice: "en-GB-x-rp"
+    pretrained_checkpoint: "/home/jay/p4p/piper_training/pretrained/alan_medium/en/en_GB/alan/medium/alan-medium-stripped.ckpt"
+    pi_bundle: "/home/jay/voice-pipeline/export/en_pi_bundle"
+
+  zh:
+    qwen_language: "Chinese"
+    reference_audio: ""  # fill in after recording Mandarin clips
+    reference_transcript: ""
+    corpus: ""           # fill in when Mandarin text corpus is sourced
+    espeak_voice: "cmn"
+    pretrained_checkpoint: ""  # use a Piper zh_CN pretrained checkpoint
+    pi_bundle: "/home/jay/voice-pipeline/export/zh_pi_bundle"
+
+  yue:
+    qwen_language: "Cantonese"
+    reference_audio: ""  # fill in after recording Cantonese clips
+    reference_transcript: ""
+    corpus: ""           # fill in when Cantonese text corpus is sourced
+    espeak_voice: "yue"
+    pretrained_checkpoint: ""
+    pi_bundle: "/home/jay/voice-pipeline/export/yue_pi_bundle"

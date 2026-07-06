@@ -1,0 +1,32 @@
+# Large binary artifacts
+*.wav
+*.onnx
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.bin
+
+# Model and dataset directories
+models/
+datasets/
+export/
+outputs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+
+# Training logs
+lightning_logs/
+tensorboard/
+
+# Fallback cache (generated at runtime)
+fallback/cache/
+
+# OS
+.DS_Store
+Thumbs.db
