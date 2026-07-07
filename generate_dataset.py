@@ -18,11 +18,101 @@ import time
 from math import gcd
 from pathlib import Path
 
+import numpy as np
 import yaml
 
 PIPER_SAMPLE_RATE = 22050
 MIN_WORDS = 5
-MAX_WORDS = 30
+MAX_WORDS = 20  # lowered from 30: long utterances risk autoregressive collapse in Qwen3-TTS
+
+# --- Quality-control gate for generated clips -------------------------------
+# Qwen3-TTS is autoregressive: past ~10-12s in a single generation the acoustic
+# token trajectory can drift out-of-distribution and collapse. Observed failure
+# mode is a high-pitched "stuck" screech in the tail (the decoder loops on a
+# token): the spectral centroid jumps up and frame-to-frame spectral flux drops.
+# A clip with a garbage tail is poison for Piper training, so we reject it here.
+#
+# NOTE: the tail thresholds below were calibrated on a small number of real
+# rejects. As rejects.csv accumulates, revisit them against that corpus.
+MAX_DURATION_S = 11.0          # hard duration cap; reject anything longer
+QC_FRAME_MS = 50               # analysis frame size
+QC_TAIL_FRAC = 0.25            # "tail" = last 25% of the clip
+QC_BODY_FRAC = 0.70            # "body" = first 70% of the clip
+QC_ACTIVE_RMS_FRAC = 0.15      # a frame is "active" (non-silence) if rms > this * peak_rms
+QC_CENTROID_RATIO = 1.5        # tail centroid this much higher than body => suspicious
+QC_CENTROID_ABS_HZ = 1600.0    # ...and above this absolute pitch (avoids quiet-taper false positives)
+QC_FLUX_RATIO = 0.75           # ...and tail spectrum this much more static (stuck) than body
+QC_HARD_NOISE_FLATNESS = 0.5   # any active tail frame this flat => outright broadband noise
+
+
+def _frame_stats(wav: np.ndarray, sr: int, frame_ms: int):
+    """Per-frame RMS, spectral flatness, centroid (Hz), flux, and center times."""
+    n = max(1, int(sr * frame_ms / 1000))
+    total = len(wav) // n
+    if total == 0:
+        empty = np.array([])
+        return empty, empty, empty, empty, empty
+    frames = wav[: total * n].reshape(total, n).astype("float64")
+    rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)
+
+    win = np.hanning(n)
+    mag = np.abs(np.fft.rfft(frames * win, axis=1)) + 1e-10
+    freqs = np.fft.rfftfreq(n, 1.0 / sr)
+
+    power = mag ** 2
+    geo = np.exp(np.mean(np.log(power), axis=1))
+    flatness = geo / np.mean(power, axis=1)            # Wiener entropy: ~0 tonal, ~1 noise
+    centroid = (mag * freqs).sum(axis=1) / mag.sum(axis=1)  # spectral centroid in Hz
+
+    norm = mag / mag.sum(axis=1, keepdims=True)        # L1-normalized spectra
+    flux = np.concatenate([[0.0], np.sqrt(((norm[1:] - norm[:-1]) ** 2).sum(axis=1))])
+
+    centers = (np.arange(total) + 0.5) * n / sr
+    return rms, flatness, centroid, flux, centers
+
+
+def qc_check(wav: np.ndarray, sr: int, max_duration: float) -> tuple[bool, str]:
+    """Return (ok, reason). Flags over-long clips and degenerate/screech tails."""
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+    duration = len(wav) / sr
+    if duration > max_duration:
+        return False, f"too_long ({duration:.1f}s > {max_duration:.1f}s)"
+
+    rms, flatness, centroid, flux, centers = _frame_stats(wav, sr, QC_FRAME_MS)
+    if len(rms) < 6:
+        return True, ""  # too short to analyze; duration cap already passed
+
+    peak = float(rms.max())
+    if peak <= 0:
+        return False, "silent"
+    active = rms > QC_ACTIVE_RMS_FRAC * peak
+    tail_mask = active & (centers >= duration * (1 - QC_TAIL_FRAC))
+    body_mask = active & (centers <= duration * QC_BODY_FRAC)
+
+    if not tail_mask.any() or not body_mask.any():
+        return True, ""  # tail is silence (clean taper) or no usable body — fine
+
+    # Broadband-noise collapse: any active tail frame that is noise-flat.
+    if float(flatness[tail_mask].max()) > QC_HARD_NOISE_FLATNESS:
+        return False, f"noise_tail (flatness={flatness[tail_mask].max():.2f})"
+
+    # Stuck-tone / screech collapse: tail pitch jumps up AND spectrum goes static.
+    tail_cent = float(np.median(centroid[tail_mask]))
+    body_cent = float(np.median(centroid[body_mask]))
+    tail_flux = float(np.median(flux[tail_mask]))
+    body_flux = float(np.median(flux[body_mask])) + 1e-9
+    if (
+        tail_cent > QC_CENTROID_RATIO * body_cent
+        and tail_cent > QC_CENTROID_ABS_HZ
+        and tail_flux < QC_FLUX_RATIO * body_flux
+    ):
+        return False, (
+            f"screech_tail (centroid {body_cent:.0f}->{tail_cent:.0f}Hz, "
+            f"flux ratio {tail_flux / body_flux:.2f})"
+        )
+
+    return True, ""
 
 
 def load_config(config_path: Path) -> dict:
@@ -30,7 +120,9 @@ def load_config(config_path: Path) -> dict:
         return yaml.safe_load(f)
 
 
-def load_texts(corpus_path: Path, start_idx: int, count: int) -> list[tuple[str, str]]:
+def load_texts(
+    corpus_path: Path, start_idx: int, count: int, max_words: int
+) -> list[tuple[str, str]]:
     rows = []
     with open(corpus_path, encoding="utf-8") as f:
         reader = csv.reader(f, delimiter="|")
@@ -38,7 +130,10 @@ def load_texts(corpus_path: Path, start_idx: int, count: int) -> list[tuple[str,
             if len(row) < 2:
                 continue
             stem, text = row[0], row[1].strip()
-            if MIN_WORDS <= len(text.split()) <= MAX_WORDS:
+            if MIN_WORDS <= len(text.split()) <= max_words:
+                # Ensure terminal punctuation so the model has a clean stop cue.
+                if text and text[-1] not in ".?!":
+                    text += "."
                 rows.append((stem, text))
     return rows[start_idx : start_idx + count]
 
@@ -77,6 +172,23 @@ def main() -> int:
         default=Path(__file__).parent / "config.yaml",
     )
     parser.add_argument("--output-dir", type=Path, default=None, help="Override output dir")
+    parser.add_argument(
+        "--max-words",
+        type=int,
+        default=MAX_WORDS,
+        help=f"Skip corpus sentences longer than this (default {MAX_WORDS}).",
+    )
+    parser.add_argument(
+        "--max-duration",
+        type=float,
+        default=MAX_DURATION_S,
+        help=f"Reject generated clips longer than this many seconds (default {MAX_DURATION_S}).",
+    )
+    parser.add_argument(
+        "--no-qc",
+        action="store_true",
+        help="Disable the quality-control gate (not recommended for training data).",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -109,9 +221,11 @@ def main() -> int:
 
     wavs_dir = output_dir / "wavs"
     wavs_dir.mkdir(parents=True, exist_ok=True)
+    rejected_dir = output_dir / "rejected"
     metadata_path = output_dir / "metadata.csv"
+    rejects_path = output_dir / "rejects.csv"
 
-    texts = load_texts(corpus_path, args.start_idx, args.count)
+    texts = load_texts(corpus_path, args.start_idx, args.count, args.max_words)
     if not texts:
         print("ERROR: no texts loaded (check corpus path and word-count filter)", file=sys.stderr)
         return 1
@@ -143,7 +257,7 @@ def main() -> int:
     )
     print(f"Model loaded. Generating {args.lang} clips -> {output_dir}")
 
-    generated = skipped = errors = 0
+    generated = skipped = errors = rejected = 0
 
     with open(metadata_path, "a", newline="", encoding="utf-8") as meta_f:
         for i, (_, text) in enumerate(texts):
@@ -173,6 +287,22 @@ def main() -> int:
                 if sample_rate != PIPER_SAMPLE_RATE:
                     wav = resample_to_piper(wav, sample_rate)
 
+                # Quality-control gate: quarantine bad clips instead of training on them.
+                ok, reason = (True, "") if args.no_qc else qc_check(
+                    np.asarray(wav), PIPER_SAMPLE_RATE, args.max_duration
+                )
+                if not ok:
+                    rejected_dir.mkdir(parents=True, exist_ok=True)
+                    sf.write(str(rejected_dir / f"{stem}.wav"), wav, PIPER_SAMPLE_RATE)
+                    write_header = not rejects_path.exists()
+                    with open(rejects_path, "a", newline="", encoding="utf-8") as rej_f:
+                        if write_header:
+                            rej_f.write("stem|reason|text\n")
+                        rej_f.write(f"{stem}|{reason}|{text}\n")
+                    rejected += 1
+                    print(f"    QUARANTINED ({reason}) -> rejected/{stem}.wav")
+                    continue
+
                 sf.write(str(wav_path), wav, PIPER_SAMPLE_RATE)
                 meta_f.write(f"{stem}|{text}\n")
                 meta_f.flush()
@@ -183,8 +313,13 @@ def main() -> int:
                 print(f"    ERROR: {exc}")
                 errors += 1
 
-    print(f"\nDone.  Generated: {generated}  Skipped: {skipped}  Errors: {errors}")
+    print(
+        f"\nDone.  Generated: {generated}  Skipped: {skipped}  "
+        f"Rejected: {rejected}  Errors: {errors}"
+    )
     print(f"Dataset: {output_dir}")
+    if rejected:
+        print(f"Quarantined clips logged in: {rejects_path}")
     return 0 if errors == 0 else 1
 
 
