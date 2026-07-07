@@ -15,8 +15,10 @@ import argparse
 import csv
 import sys
 import time
+from dataclasses import dataclass
 from math import gcd
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import yaml
@@ -122,19 +124,19 @@ def load_config(config_path: Path) -> dict:
 
 def load_texts(
     corpus_path: Path, start_idx: int, count: int, max_words: int
-) -> list[tuple[str, str]]:
+) -> list[str]:
     rows = []
     with open(corpus_path, encoding="utf-8") as f:
         reader = csv.reader(f, delimiter="|")
         for row in reader:
             if len(row) < 2:
                 continue
-            stem, text = row[0], row[1].strip()
+            text = row[1].strip()
             if MIN_WORDS <= len(text.split()) <= max_words:
                 # Ensure terminal punctuation so the model has a clean stop cue.
                 if text and text[-1] not in ".?!":
                     text += "."
-                rows.append((stem, text))
+                rows.append(text)
     return rows[start_idx : start_idx + count]
 
 
@@ -159,6 +161,100 @@ def resample_to_piper(wav, orig_sr: int):
     g = gcd(orig_sr, PIPER_SAMPLE_RATE)
     resampled = resample_poly(wav, PIPER_SAMPLE_RATE // g, orig_sr // g)
     return resampled.astype("float32")
+
+
+@dataclass
+class GenerationStats:
+    generated: int = 0
+    skipped: int = 0
+    rejected: int = 0
+    errors: int = 0
+
+
+# A synthesizer takes a sentence and returns (waveform, sample_rate).
+Synthesizer = Callable[[str], "tuple[np.ndarray, int]"]
+
+
+def generate_dataset(
+    texts: list[str],
+    output_dir: Path,
+    synthesize: Synthesizer,
+    *,
+    stem_prefix: str = "jay",
+    start_idx: int = 0,
+    max_duration: float = MAX_DURATION_S,
+    qc: bool = True,
+) -> GenerationStats:
+    """Generate an LJSpeech-format dataset directory from texts.
+
+    Writes wavs/<stem>.wav at 22050 Hz and appends `stem|text` lines to
+    metadata.csv. QC-failing clips are quarantined to rejected/ and logged to
+    rejects.csv; they never enter metadata.csv. Stems already present in
+    metadata.csv (or on disk) are skipped, so an interrupted run resumes.
+    """
+    import soundfile as sf
+
+    output_dir = Path(output_dir)
+    wavs_dir = output_dir / "wavs"
+    wavs_dir.mkdir(parents=True, exist_ok=True)
+    rejected_dir = output_dir / "rejected"
+    metadata_path = output_dir / "metadata.csv"
+    rejects_path = output_dir / "rejects.csv"
+
+    existing = load_existing_stems(metadata_path)
+    if existing:
+        print(f"Resuming: {len(existing)} clips already exist, will skip them")
+
+    stats = GenerationStats()
+    with open(metadata_path, "a", newline="", encoding="utf-8") as meta_f:
+        for i, text in enumerate(texts):
+            stem = f"{stem_prefix}_{start_idx + i + 1:04d}"
+            wav_path = wavs_dir / f"{stem}.wav"
+
+            if stem in existing or wav_path.exists():
+                stats.skipped += 1
+                continue
+
+            print(f"  [{i + 1}/{len(texts)}] {stem}: {text[:60]}...")
+            t0 = time.perf_counter()
+            try:
+                wav, sample_rate = synthesize(text)
+
+                if wav is None or len(wav) == 0:
+                    print("    WARN: empty output, skipping")
+                    stats.errors += 1
+                    continue
+
+                if sample_rate != PIPER_SAMPLE_RATE:
+                    wav = resample_to_piper(wav, sample_rate)
+
+                # Quality-control gate: quarantine bad clips instead of training on them.
+                ok, reason = (True, "") if not qc else qc_check(
+                    np.asarray(wav), PIPER_SAMPLE_RATE, max_duration
+                )
+                if not ok:
+                    rejected_dir.mkdir(parents=True, exist_ok=True)
+                    sf.write(str(rejected_dir / f"{stem}.wav"), wav, PIPER_SAMPLE_RATE)
+                    write_header = not rejects_path.exists()
+                    with open(rejects_path, "a", newline="", encoding="utf-8") as rej_f:
+                        if write_header:
+                            rej_f.write("stem|reason|text\n")
+                        rej_f.write(f"{stem}|{reason}|{text}\n")
+                    stats.rejected += 1
+                    print(f"    QUARANTINED ({reason}) -> rejected/{stem}.wav")
+                    continue
+
+                sf.write(str(wav_path), wav, PIPER_SAMPLE_RATE)
+                meta_f.write(f"{stem}|{text}\n")
+                meta_f.flush()
+                stats.generated += 1
+                print(f"    -> {wav_path.name}  ({time.perf_counter() - t0:.1f}s)")
+
+            except Exception as exc:
+                print(f"    ERROR: {exc}")
+                stats.errors += 1
+
+    return stats
 
 
 def main() -> int:
@@ -219,23 +315,12 @@ def main() -> int:
         print("Set corpus in config.yaml for this language.", file=sys.stderr)
         return 1
 
-    wavs_dir = output_dir / "wavs"
-    wavs_dir.mkdir(parents=True, exist_ok=True)
-    rejected_dir = output_dir / "rejected"
-    metadata_path = output_dir / "metadata.csv"
-    rejects_path = output_dir / "rejects.csv"
-
     texts = load_texts(corpus_path, args.start_idx, args.count, args.max_words)
     if not texts:
         print("ERROR: no texts loaded (check corpus path and word-count filter)", file=sys.stderr)
         return 1
     print(f"Loaded {len(texts)} sentences from {corpus_path}")
 
-    existing = load_existing_stems(metadata_path)
-    if existing:
-        print(f"Resuming: {len(existing)} clips already exist, will skip them")
-
-    import soundfile as sf
     try:
         from qwen_tts import Qwen3TTSModel
     except ImportError:
@@ -257,70 +342,32 @@ def main() -> int:
     )
     print(f"Model loaded. Generating {args.lang} clips -> {output_dir}")
 
-    generated = skipped = errors = rejected = 0
+    def synthesize(text: str):
+        wavs, sample_rate = model.generate_voice_clone(
+            text=text,
+            language=qwen_language,
+            ref_audio=str(reference_audio),
+            ref_text=reference_transcript,
+        )
+        return (wavs[0] if wavs else None), sample_rate
 
-    with open(metadata_path, "a", newline="", encoding="utf-8") as meta_f:
-        for i, (_, text) in enumerate(texts):
-            stem = f"jay_{args.start_idx + i + 1:04d}"
-            wav_path = wavs_dir / f"{stem}.wav"
-
-            if stem in existing or wav_path.exists():
-                skipped += 1
-                continue
-
-            print(f"  [{i + 1}/{len(texts)}] {stem}: {text[:60]}...")
-            t0 = time.perf_counter()
-            try:
-                wavs, sample_rate = model.generate_voice_clone(
-                    text=text,
-                    language=qwen_language,
-                    ref_audio=str(reference_audio),
-                    ref_text=reference_transcript,
-                )
-
-                if not wavs:
-                    print("    WARN: empty output, skipping")
-                    errors += 1
-                    continue
-
-                wav = wavs[0]
-                if sample_rate != PIPER_SAMPLE_RATE:
-                    wav = resample_to_piper(wav, sample_rate)
-
-                # Quality-control gate: quarantine bad clips instead of training on them.
-                ok, reason = (True, "") if args.no_qc else qc_check(
-                    np.asarray(wav), PIPER_SAMPLE_RATE, args.max_duration
-                )
-                if not ok:
-                    rejected_dir.mkdir(parents=True, exist_ok=True)
-                    sf.write(str(rejected_dir / f"{stem}.wav"), wav, PIPER_SAMPLE_RATE)
-                    write_header = not rejects_path.exists()
-                    with open(rejects_path, "a", newline="", encoding="utf-8") as rej_f:
-                        if write_header:
-                            rej_f.write("stem|reason|text\n")
-                        rej_f.write(f"{stem}|{reason}|{text}\n")
-                    rejected += 1
-                    print(f"    QUARANTINED ({reason}) -> rejected/{stem}.wav")
-                    continue
-
-                sf.write(str(wav_path), wav, PIPER_SAMPLE_RATE)
-                meta_f.write(f"{stem}|{text}\n")
-                meta_f.flush()
-                generated += 1
-                print(f"    -> {wav_path.name}  ({time.perf_counter() - t0:.1f}s)")
-
-            except Exception as exc:
-                print(f"    ERROR: {exc}")
-                errors += 1
+    stats = generate_dataset(
+        texts,
+        output_dir,
+        synthesize,
+        start_idx=args.start_idx,
+        max_duration=args.max_duration,
+        qc=not args.no_qc,
+    )
 
     print(
-        f"\nDone.  Generated: {generated}  Skipped: {skipped}  "
-        f"Rejected: {rejected}  Errors: {errors}"
+        f"\nDone.  Generated: {stats.generated}  Skipped: {stats.skipped}  "
+        f"Rejected: {stats.rejected}  Errors: {stats.errors}"
     )
     print(f"Dataset: {output_dir}")
-    if rejected:
-        print(f"Quarantined clips logged in: {rejects_path}")
-    return 0 if errors == 0 else 1
+    if stats.rejected:
+        print(f"Quarantined clips logged in: {output_dir / 'rejects.csv'}")
+    return 0 if stats.errors == 0 else 1
 
 
 if __name__ == "__main__":
