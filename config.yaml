@@ -38,6 +38,8 @@ languages:
       The cat gave a tiny meow.
       So Milo turned the key, pushed the door open, and stepped into a brand-new adventure.
     corpus: "/home/jay/p4p/piper_training/LJSpeech-1.1/metadata.csv"
+    # espeak-ng has no en-AU voice; en-GB-x-rp is the closest match
+    # (decision recorded in docs/training-notes.md "Decisions").
     espeak_voice: "en-GB-x-rp"
     pretrained_checkpoint: "/home/jay/p4p/piper_training/pretrained/alan_medium/en/en_GB/alan/medium/alan-medium-stripped.ckpt"
     pi_bundle: "/home/jay/voice-pipeline/export/en_pi_bundle"
