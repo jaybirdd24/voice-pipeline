@@ -22,4 +22,6 @@ Single-context repo. `CONTEXT.md` and `docs/adr/` don't exist yet — created la
 .venv/bin/python -m pytest
 ```
 
-The repo-local `.venv` (create with `python3 -m venv .venv && .venv/bin/pip install pytest numpy scipy soundfile pyyaml`) is deliberately light: tests stub the Qwen3-TTS synthesizer at its seam, so no torch/qwen-tts needed. Real-model smoke runs use the Qwen3 venv at `/home/jay/p4p/qwen3_tts_test/.venv/` instead. Tests live in `tests/` and assert only at the approved seams (dataset directory, fallback cache, Pi speak interface).
+The repo-local `.venv` (create with `python3 -m venv .venv && .venv/bin/pip install pytest numpy scipy soundfile pyyaml`) is deliberately light: tests stub the Qwen3-TTS synthesizer and the piper/aplay subprocesses at their seams, so no torch/qwen-tts/piper needed. Real-model smoke runs use the Qwen3 venv at `/home/jay/p4p/qwen3_tts_test/.venv/` instead. Tests live in `tests/` and assert only at the approved seams (dataset directory, fallback cache, Pi speak interface).
+
+Tests marked `smoke` exercise the real piper CLI and are **deselected by default** (`addopts = -m "not smoke"` in pytest.ini). Run them with `.venv/bin/python -m pytest -m smoke -v` — the `-m smoke` filter is needed even when targeting a smoke test file directly. Asset paths are env-overridable (`PIPER_BIN`, `STOCK_VOICE`); missing assets skip rather than fail.

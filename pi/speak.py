@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import tempfile
@@ -25,36 +26,65 @@ LANG_VOICE = {
 }
 
 
-def find_bundle(lang: str) -> tuple[Path, Path] | None:
+def find_bundle(lang: str, bundle_dir: Path = BUNDLE_DIR) -> tuple[Path, Path] | None:
     voice_name = LANG_VOICE.get(lang)
     if not voice_name:
         return None
-    onnx = BUNDLE_DIR / f"{voice_name}.onnx"
-    config = BUNDLE_DIR / f"{voice_name}.onnx.json"
+    onnx = bundle_dir / f"{voice_name}.onnx"
+    config = bundle_dir / f"{voice_name}.onnx.json"
     if onnx.is_file() and config.is_file():
         return onnx, config
     return None
 
 
-def speak_piper(text: str, onnx: Path, config: Path) -> bool:
+def synthesize_wav(
+    text: str, onnx: Path, config: Path, out_path: Path, piper_bin: str = "piper"
+) -> bool:
+    """The speak seam: synthesise text with a voice bundle into out_path."""
     try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp_path = tmp.name
         result = subprocess.run(
-            ["piper", "--model", str(onnx), "--config", str(config),
-             "--output_file", tmp_path],
+            [piper_bin, "--model", str(onnx), "--config", str(config),
+             "--output_file", str(out_path)],
             input=text.encode(),
             capture_output=True,
         )
-        if result.returncode != 0:
-            print(f"[piper] error: {result.stderr.decode()}", file=sys.stderr)
-            return False
-        subprocess.run(["aplay", "-q", tmp_path], check=True)
-        Path(tmp_path).unlink(missing_ok=True)
-        return True
     except FileNotFoundError as exc:
         print(f"[piper] not found: {exc}", file=sys.stderr)
         return False
+    if result.returncode != 0:
+        print(f"[piper] error: {result.stderr.decode()}", file=sys.stderr)
+        Path(out_path).unlink(missing_ok=True)  # don't leave a partial WAV
+        return False
+    return True
+
+
+def play_wav(wav_path: Path, player: tuple[str, ...] = ("aplay", "-q")) -> bool:
+    try:
+        result = subprocess.run([*player, str(wav_path)])
+    except FileNotFoundError as exc:
+        print(f"[player] not found: {exc}", file=sys.stderr)
+        return False
+    if result.returncode != 0:
+        print(f"[player] failed (exit {result.returncode})", file=sys.stderr)
+        return False
+    return True
+
+
+def speak_piper(
+    text: str,
+    onnx: Path,
+    config: Path,
+    piper_bin: str = "piper",
+    player: tuple[str, ...] = ("aplay", "-q"),
+) -> bool:
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        if not synthesize_wav(text, onnx, config, tmp_path, piper_bin=piper_bin):
+            return False
+        return play_wav(tmp_path, player=player)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def speak_fallback(text: str, lang: str, fallback_url: str) -> bool:
@@ -91,14 +121,24 @@ def main() -> int:
                         help="Qwen3-TTS server URL, e.g. http://192.168.1.100:8000")
     parser.add_argument("--force-fallback", action="store_true",
                         help="Skip Piper and go straight to fallback server")
+    parser.add_argument("--output", type=Path, default=None,
+                        help="Write the WAV here instead of playing it")
+    parser.add_argument("--bundle-dir", type=Path, default=BUNDLE_DIR,
+                        help=f"Where the voice bundles live (default {BUNDLE_DIR})")
     args = parser.parse_args()
 
+    piper_bin = os.environ.get("PIPER_BIN", "piper")
+
     if not args.force_fallback:
-        bundle = find_bundle(args.lang)
+        bundle = find_bundle(args.lang, bundle_dir=args.bundle_dir)
         if bundle:
             onnx, config = bundle
             print(f"[piper] {onnx.name}", file=sys.stderr)
-            if speak_piper(args.text, onnx, config):
+            if args.output:
+                return 0 if synthesize_wav(
+                    args.text, onnx, config, args.output, piper_bin=piper_bin
+                ) else 1
+            if speak_piper(args.text, onnx, config, piper_bin=piper_bin):
                 return 0
             print("[piper] failed, trying fallback...", file=sys.stderr)
 
